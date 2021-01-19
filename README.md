@@ -15,7 +15,7 @@ USDT TRC20: TEWZoBgyLDRHWqKCCEjSkqRW1WnB3WL2hR
 Первый запуск создаст файлы Options.txt и Risk.txt.  
 Options.txt содержит:  
 ```
-telegram chat id - используйте @chat_id_echo_bot, для того чтобы узнать свой Chat id
+telegram chat id - используйте @chatid_echo_bot, для того чтобы узнать свой Chat id
 binance api key
 binance api secret key
 telegram bot api key - получить у @BotFather
