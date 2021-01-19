@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/adshao/go-binance"
 	"github.com/adshao/go-binance/futures"
@@ -53,6 +54,7 @@ func main() {
 
 	updates, err := bot.GetUpdatesChan(u)
 	go ordersAlerts(bot, chatid, key, skey)
+	go balanceAlerts(bot, chatid, key, skey)
 	for update := range updates {
 		if update.Message == nil { // ignore any non-Message Updates
 			continue
@@ -67,7 +69,7 @@ func main() {
 
 			switch {
 			case data[0] == "help" || data[0] == "Help":
-				msg.Text = "Об исполнение ордеров бот уведомляет автоматически.\nКоманды:\norder символ без usdt первый ордер последний ордер стоп.\nПример: order BTC 23000 23500 23700.\nlist список активных ордеров.\nrisk установка риска на позицию в процентах.\nПример: risk 1."
+				msg.Text = "Об исполнение ордеров бот уведомляет автоматически.\nКоманды:\norder символ без usdt первый ордер последний ордер стоп.\nПример: order BTC 23000 23500 23700.\nlist список активных ордеров.\nrisk установка риска на позицию в процентах.\nПример: risk 1.\nspot текущие позиции на спотовом рынке.\nbalance текущий спотовый баланс."
 				bot.Send(msg)
 			case data[0] == "order" || data[0] == "Order":
 				// data[0] - command, data[1] - symbol, data[2] - start price, data[3] - orders stop price, data[4] - stop price
@@ -136,6 +138,26 @@ func main() {
 				riskReplace(fmt.Sprintf("%f", risk))
 				msg.Text = "Риск установлен."
 				bot.Send(msg)
+			case data[0] == "Spot" || data[0] == "spot":
+				client := binance.NewClient(key, skey)
+				client.NewSetServerTimeService().Do(context.Background())
+				account, err := client.NewGetAccountService().Do(context.Background())
+				if err != nil {
+					fmt.Println(err)
+					return
+				}
+				for _, o := range account.Balances {
+					balance, _ := strconv.ParseFloat(o.Free, 64)
+					if balance != 0 {
+						if o.Asset != "BNB" {
+							msg.Text = msg.Text + ListOrders(client, o.Asset, "BTC") + ListOrders(client, o.Asset, "USDT") + ListOrders(client, o.Asset, "BUSD") + "\n"
+						}
+					}
+				}
+				bot.Send(msg)
+			case data[0] == "Balance" || data[0] == "balance":
+				msg.Text = fmt.Sprintf("Баланс: %f", GetBalance(key, skey)) + "$"
+				bot.Send(msg)
 			default:
 				msg.Text = "Нет такой функции."
 				bot.Send(msg)
@@ -154,6 +176,72 @@ func exit() {
 		} else {
 			fmt.Println("Press 'q' to quit")
 		}
+	}
+}
+
+func GetBalance(key string, skey string) (data float64) {
+	client := binance.NewClient(key, skey)
+	client.NewSetServerTimeService().Do(context.Background())
+	account, err := client.NewGetAccountService().Do(context.Background())
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	var balanceSum float64
+	for _, o := range account.Balances {
+		balance, _ := strconv.ParseFloat(o.Free, 64)
+		balanceLocked, _ := strconv.ParseFloat(o.Locked, 64)
+		if balance != 0 || balanceLocked != 0 {
+			if o.Asset == "USDT" {
+				balanceSum = balanceSum + balance + balanceLocked
+			} else {
+				klines, err := client.NewKlinesService().Symbol(o.Asset + "USDT").
+					Interval("1m").Do(context.Background())
+				if err != nil {
+					fmt.Println(err)
+					klines, err = client.NewKlinesService().Symbol(o.Asset + "BUSD").
+						Interval("1m").Do(context.Background())
+					if err != nil {
+						fmt.Println(err)
+						continue
+					}
+				}
+				currentPrice, _ := strconv.ParseFloat(klines[len(klines)-1].Close, 64)
+				balanceSum = balanceSum + balance*currentPrice + balanceLocked*currentPrice
+			}
+		}
+	}
+
+	return balanceSum
+}
+
+func balanceAlerts(bot *tgbotapi.BotAPI, chatid string, key string, skey string) {
+	var balanceOld, balance float64
+	check := false
+	chat, _ := strconv.ParseInt(chatid, 10, 64)
+	msg := tgbotapi.NewMessage(chat, "")
+	client := binance.NewClient(key, skey)
+	client.NewSetServerTimeService().Do(context.Background())
+	for {
+		fmt.Println("Checking balance")
+		if check == false {
+			balanceOld = GetBalance(key, skey)
+			check = true
+		} else {
+			balance = GetBalance(key, skey)
+			percent := balanceOld * 0.05
+			switch {
+			case balance-balanceOld > percent:
+				msg.Text = "Баланс вырос на 5%.\n Текущий баланс: " + fmt.Sprintf("%f", balance)
+				balanceOld = balance
+			case balance-balanceOld < -percent:
+				msg.Text = "Баланс упал на 5%.\n Текущий баланс: " + fmt.Sprintf("%f", balance)
+				balanceOld = balance
+			}
+		}
+		bot.Send(msg)
+		time.Sleep(time.Minute * 10)
 	}
 }
 
@@ -411,5 +499,86 @@ func inArray(val interface{}, array interface{}) (exists bool) {
 		}
 	}
 
+	return
+}
+
+func ListOrders(client *binance.Client, symbol string, ticker string) (data string) {
+	var cumQty, posPrice, orderPrice, currentPrice float64
+	var first bool
+	orders, err := client.NewListOrdersService().Symbol(symbol + ticker).
+		Do(context.Background())
+	if err != nil {
+		return
+	}
+	for _, o := range orders {
+		//market order price = cummulativeQuoteQty/executedQty
+		if o.Status == binance.OrderStatusTypeFilled {
+			if o.Side == binance.SideTypeBuy {
+				qty, _ := strconv.ParseFloat(o.OrigQuantity, 64)
+				if first {
+					if o.Type == binance.OrderTypeLimit {
+						posPrice, err = strconv.ParseFloat(o.Price, 64)
+						if err != nil {
+							fmt.Println(err)
+						}
+					} else {
+						quote, err := strconv.ParseFloat(o.CummulativeQuoteQuantity, 64)
+						if err != nil {
+							fmt.Println(err)
+						}
+						posPrice = quote / qty
+					}
+				} else {
+					if o.Type == binance.OrderTypeLimit {
+						orderPrice, _ = strconv.ParseFloat(o.Price, 64)
+					} else {
+						quote, err := strconv.ParseFloat(o.CummulativeQuoteQuantity, 64)
+						if err != nil {
+							fmt.Println(err)
+						}
+						orderPrice = quote / qty
+					}
+					posPrice = posPrice*(cumQty/(cumQty+qty)) + orderPrice*(qty/(cumQty+qty))
+				}
+				cumQty = cumQty + qty
+			} else {
+				qty, _ := strconv.ParseFloat(o.OrigQuantity, 64)
+				cumQty = cumQty - qty
+			}
+		}
+	}
+	switch {
+	case posPrice*cumQty > 10 && (ticker == "USDT" || ticker == "BUSD") && symbol != "BUSD":
+		klines, err := client.NewKlinesService().Symbol(symbol + ticker).
+			Interval("1m").Do(context.Background())
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		currentPrice, _ = strconv.ParseFloat(klines[len(klines)-1].Close, 64)
+		pnl := cumQty*currentPrice - cumQty*posPrice
+		fmt.Println(symbol, "USDT QTY:", cumQty*posPrice, "QTY:", cumQty, "AvgPrice:", posPrice, "PNL:", pnl)
+		data = "\n" + symbol + "/" + ticker + fmt.Sprintf("\nUSDT QTY: %f", cumQty*posPrice) + fmt.Sprintf("\nQTY: %f", cumQty) + fmt.Sprintf("\nAvgPrice: %f", posPrice) + fmt.Sprintf("\nPrice: %f", currentPrice) + fmt.Sprintf("\nPNL: %f", pnl) + "$"
+		return data
+	case round(cumQty, 8) > 0 && ticker == "BTC":
+		klines, err := client.NewKlinesService().Symbol(symbol + ticker).
+			Interval("1m").Do(context.Background())
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		klinesBTC, err := client.NewKlinesService().Symbol("BTCUSDT").
+			Interval("1m").Do(context.Background())
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		currentPrice, _ = strconv.ParseFloat(klines[len(klines)-1].Close, 64)
+		BTCprice, _ := strconv.ParseFloat(klinesBTC[len(klinesBTC)-1].Close, 64)
+		pnl := cumQty*currentPrice - cumQty*posPrice
+		fmt.Println(symbol, "BTC QTY:", cumQty*posPrice, "QTY:", cumQty, "AvgPrice:", posPrice, "PNL:", pnl, "USDT PNL:", pnl*BTCprice)
+		data = "\n" + symbol + "/" + ticker + fmt.Sprintf("\nBTC QTY: %f", cumQty*posPrice) + fmt.Sprintf("\nQTY: %f", cumQty) + fmt.Sprintf("\nAvgPrice: %.8f", posPrice) + fmt.Sprintf("\nPrice: %.8f", currentPrice) + fmt.Sprintf("\nPNL: %.8f", pnl) + " BTC" + fmt.Sprintf("\nUSDT PNL:  %f", pnl*BTCprice) + "$"
+		return data
+	}
 	return
 }
