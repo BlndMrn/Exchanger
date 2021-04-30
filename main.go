@@ -69,7 +69,7 @@ func main() {
 
 			switch {
 			case data[0] == "help" || data[0] == "Help":
-				msg.Text = "Об исполнение ордеров бот уведомляет автоматически.\nКоманды:\norder символ без usdt первый ордер последний ордер стоп.\nПример: order BTC 23000 23500 23700.\nlist список активных ордеров.\nrisk установка риска на позицию в процентах.\nПример: risk 1.\nspot текущие позиции на спотовом рынке.\nbalance текущий спотовый баланс."
+				msg.Text = "Об исполнение ордеров бот уведомляет автоматически.\nКоманды:\norder символ без usdt первый ордер последний ордер стоп.\nПример: order BTC 23000 23500 23700.\nlist список активных ордеров.\nrisk установка риска на позицию в процентах.\nПример: risk 1."
 				bot.Send(msg)
 			case data[0] == "order" || data[0] == "Order":
 				// data[0] - command, data[1] - symbol, data[2] - start price, data[3] - orders stop price, data[4] - stop price
@@ -156,8 +156,18 @@ func main() {
 				}
 				bot.Send(msg)
 			case data[0] == "Balance" || data[0] == "balance":
-				msg.Text = fmt.Sprintf("Баланс: %f", GetBalance(key, skey)) + "$"
+
+				balanceS, balanceF := GetBalance(key, skey)
+				msg.Text = fmt.Sprintf("Balance Sum: %f$\nBalance Futures: %f$\nBalance Spot: %f$", balanceS+balanceF, balanceF, balanceS)
 				bot.Send(msg)
+			case data[0] == "Sell" || data[0] == "sell":
+				//sell symbol price qty
+				fmt.Printf(data[0] + " " + data[1] + " " + data[2] + " " + data[3])
+				if len(data) < 4 {
+					msg.Text = "Неверная команда. Пример sell BTCUSDT 60000 0.1"
+					bot.Send(msg)
+				}
+				go Sell(bot, chatid, key, skey, data[1], data[2], data[3])
 			default:
 				msg.Text = "Нет такой функции."
 				bot.Send(msg)
@@ -179,22 +189,68 @@ func exit() {
 	}
 }
 
-func GetBalance(key string, skey string) (data float64) {
+func Sell(bot *tgbotapi.BotAPI, chatid string, key string, skey string, symbol string, price string, qty string) {
+	client := binance.NewClient(key, skey)
+	client.NewSetServerTimeService().Do(context.Background())
+	chat, _ := strconv.ParseInt(chatid, 10, 64)
+	msg := tgbotapi.NewMessage(chat, "")
+	orderPrice, _ := strconv.ParseFloat(price, 64)
+	klines, err := client.NewKlinesService().Symbol(strings.ToUpper(symbol)).
+		Interval("1m").Do(context.Background())
+	if err != nil {
+		fmt.Println(err)
+	}
+	currentPrice, _ := strconv.ParseFloat(klines[len(klines)-1].Close, 64)
+	if currentPrice > orderPrice {
+		msg.Text = "Цена ордера ниже текущей цены."
+		bot.Send(msg)
+		return
+	} else {
+		for {
+
+			if (currentPrice/orderPrice - 1) < 0.7 {
+				_, err := client.NewCreateOrderService().Symbol(strings.ToUpper(symbol)).
+					Side(binance.SideTypeSell).Type(binance.OrderTypeLimit).
+					TimeInForce(binance.TimeInForceTypeGTC).Quantity(qty).
+					Price(price).Do(context.Background())
+				if err != nil {
+					msg.Text = err.Error()
+					bot.Send(msg)
+					return
+				}
+				msg.Text = "Ордер выставлен: " + symbol + " " + strings.ToUpper(symbol) + " " + qty
+				bot.Send(msg)
+				return
+			} else {
+				time.Sleep(time.Minute)
+				klines, _ = client.NewKlinesService().Symbol(strings.ToUpper(symbol)).
+					Interval("1m").Do(context.Background())
+				currentPrice, _ = strconv.ParseFloat(klines[len(klines)-1].Close, 64)
+			}
+		}
+	}
+}
+
+func GetBalance(key string, skey string) (spotBalance float64, futuresBalance float64) {
 	client := binance.NewClient(key, skey)
 	client.NewSetServerTimeService().Do(context.Background())
 	account, err := client.NewGetAccountService().Do(context.Background())
 	if err != nil {
 		fmt.Println(err)
-		return
 	}
-
-	var balanceSum float64
+	futuresClient := binance.NewFuturesClient(key, skey)
+	futuresClient.NewSetServerTimeService().Do(context.Background())
+	accountFutures, err := futuresClient.NewGetBalanceService().Do(context.Background())
+	if err != nil {
+		fmt.Println(err)
+	}
+	futuresBalance, _ = strconv.ParseFloat(accountFutures[0].Balance, 64)
 	for _, o := range account.Balances {
 		balance, _ := strconv.ParseFloat(o.Free, 64)
 		balanceLocked, _ := strconv.ParseFloat(o.Locked, 64)
 		if balance != 0 || balanceLocked != 0 {
 			if o.Asset == "USDT" {
-				balanceSum = balanceSum + balance + balanceLocked
+				spotBalance = spotBalance + balance + balanceLocked
 			} else {
 				klines, err := client.NewKlinesService().Symbol(o.Asset + "USDT").
 					Interval("1m").Do(context.Background())
@@ -208,39 +264,47 @@ func GetBalance(key string, skey string) (data float64) {
 					}
 				}
 				currentPrice, _ := strconv.ParseFloat(klines[len(klines)-1].Close, 64)
-				balanceSum = balanceSum + balance*currentPrice + balanceLocked*currentPrice
+				spotBalance = spotBalance + balance*currentPrice + balanceLocked*currentPrice
 			}
 		}
 	}
 
-	return balanceSum
+	return spotBalance, futuresBalance
 }
 
 func balanceAlerts(bot *tgbotapi.BotAPI, chatid string, key string, skey string) {
 	var balanceOld, balance float64
 	check := false
 	chat, _ := strconv.ParseInt(chatid, 10, 64)
-	msg := tgbotapi.NewMessage(chat, "")
 	client := binance.NewClient(key, skey)
-	client.NewSetServerTimeService().Do(context.Background())
+	msg := tgbotapi.NewMessage(chat, "")
 	for {
 		fmt.Println("Checking balance")
+		client.NewSetServerTimeService().Do(context.Background())
 		if check == false {
-			balanceOld = GetBalance(key, skey)
+			balanceS, balanceF := GetBalance(key, skey)
+			balanceOld = balanceS + balanceF
 			check = true
 		} else {
-			balance = GetBalance(key, skey)
-			percent := balanceOld * 0.05
+			balanceS, balanceF := GetBalance(key, skey)
+			balance = balanceS + balanceF
+			percent := balanceOld * 0.1
 			switch {
 			case balance-balanceOld > percent:
-				msg.Text = "Баланс вырос на 5%.\n Текущий баланс: " + fmt.Sprintf("%f", balance)
+				change := (balance/balanceOld - 1) * 100
+				msg.Text = "Хоп хей ла ла лей, баланс вырос на " + fmt.Sprintf("%0.1f", change) + ".\n Текущий баланс: " + fmt.Sprintf("%f", balance)
 				balanceOld = balance
+				bot.Send(msg)
 			case balance-balanceOld < -percent:
-				msg.Text = "Баланс упал на 5%.\n Текущий баланс: " + fmt.Sprintf("%f", balance)
+				change := (balanceOld/balance - 1) * 100
+				msg.Text = "ПечальБеда, баланс упал на " + fmt.Sprintf("%0.1f", change) + ".\n Текущий баланс: " + fmt.Sprintf("%f", balance)
 				balanceOld = balance
+				msg = tgbotapi.NewMessage(chat, msg.Text)
+				bot.Send(msg)
 			}
+			fmt.Println("Current old Balance", balanceOld)
+			fmt.Println("Current change", balance-balanceOld, "percent", percent)
 		}
-		bot.Send(msg)
 		time.Sleep(time.Minute * 10)
 	}
 }
